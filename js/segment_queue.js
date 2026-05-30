@@ -125,8 +125,503 @@ function _sqrCollectUpstream(nodeId, promptOutput, visited) {
 }
 
 
+/** 修复旧工作流/隐藏控件导致的 None、空字符串，避免 ComfyUI INT 校验失败 */
+function _sqrSanitizeRunnerWidgets(node) {
+    if (!node?.widgets) return;
+    const getW = name => node.widgets.find(w => w.name === name);
+    const segW = getW("segment_count");
+    const startW = getW("start_segment");
+    if (startW) {
+        let v = parseInt(startW.value, 10);
+        if (!Number.isFinite(v) || v < 1) v = 1;
+        const mx = segW ? Math.max(1, Math.round(segW.value)) : 100;
+        if (v > mx) v = mx;
+        startW.value = v;
+    }
+    const foW = getW("sqr_frame_offset");
+    if (foW) {
+        if (foW.value == null || foW.value === "") {
+            foW.value = "-1";
+        } else {
+            const v = parseInt(foW.value, 10);
+            foW.value = Number.isFinite(v) ? String(v) : "-1";
+        }
+    }
+    const preW = getW("sqr_pre_segments");
+    if (preW && preW.value == null) preW.value = "";
+}
+
+// ── 节点 ID 持久化 / 自动识别 ─────────────────────────────────────
+const SQR_NODE_ID_KEYS = [
+    "reference_images_node_id",
+    "reference_video_node_id",
+    "output_node_id",
+    "animate_embeds_node_id",
+];
+const SQR_AE_TYPES = new Set(["WanAnimatePlus AnimateEmbeds", "WanVideoAnimateEmbeds"]);
+const SQR_LOAD_VIDEO_MATCHERS = [
+    (t) => t === "VHS_LoadVideo" || t === "VHS Load Video",
+    (t) => /LoadVideo/i.test(t),
+];
+const SQR_LOAD_IMAGE_MATCHERS = [
+    (t) => t === "LoadImage" || t === "Load Image",
+];
+const SQR_DECODE_MATCHERS = [
+    (t) => t === "WanAnimatePlus Decode" || t === "WanVideoDecode",
+    (t) => /Decode/i.test(t) && /Wan/i.test(t),
+];
+const SQR_AE_POSE_INPUTS = ["pose_images", "face_images", "bg_images"];
+const SQR_VC_MATCHERS = [
+    (t) => t === "VHS_VideoCombine" || t === "VHS Video Combine",
+    (t) => /VideoCombine/i.test(t),
+];
+/** 工作流里节点「标题/名称」别名；完全匹配优先，用于自动识别 */
+const SQR_NODE_TITLE_ALIASES = {
+    reference_images_node_id: ["加载图像节点", "加载图像", "参考图节点", "参考图"],
+    output_node_id: ["输出视频节点", "输出视频", "视频输出节点", "视频输出"],
+    reference_video_node_id: ["参考视频节点", "加载视频节点", "参考视频", "Load Video节点"],
+    animate_embeds_node_id: ["AnimateEmbeds节点", "动作嵌入节点", "AnimateEmbeds"],
+};
+/** 标题识别时的类型提示（多节点同名时用于消歧，不强制） */
+const SQR_TITLE_TYPE_HINTS = {
+    reference_images_node_id: SQR_LOAD_IMAGE_MATCHERS,
+    output_node_id: SQR_VC_MATCHERS,
+    reference_video_node_id: SQR_LOAD_VIDEO_MATCHERS,
+    animate_embeds_node_id: [(t) => SQR_AE_TYPES.has(t)],
+};
+
+function _sqrWorkflowScope() {
+    try {
+        const g = app.graph;
+        if (g?.extra?.file) return String(g.extra.file);
+        if (g?.name) return String(g.name);
+        if (app.ui?.lastWorkflowPath) return String(app.ui.lastWorkflowPath);
+    } catch (e) {}
+    return "unsaved_workflow";
+}
+
+function _sqrNodeIdsStorageKeys(sqrNode) {
+    const scope = _sqrWorkflowScope();
+    return [
+        `sqr_node_ids_v5::${scope}::sqr_${sqrNode.id}`,
+        `sqr_node_ids_v5::${scope}`,
+    ];
+}
+
+function _sqrLoadPersistedNodeIds(sqrNode) {
+    for (const key of _sqrNodeIdsStorageKeys(sqrNode)) {
+        try {
+            const raw = localStorage.getItem(key);
+            if (!raw) continue;
+            const data = JSON.parse(raw);
+            if (data && typeof data === "object") return data;
+        } catch (e) {}
+    }
+    return null;
+}
+
+function _sqrSavePersistedNodeIds(sqrNode, ids) {
+    const payload = JSON.stringify(ids);
+    for (const key of _sqrNodeIdsStorageKeys(sqrNode)) {
+        try { localStorage.setItem(key, payload); } catch (e) {}
+    }
+}
+
+function _sqrNodeExists(nodeId) {
+    if (nodeId == null || !String(nodeId).trim()) return false;
+    const n = app.graph?.getNodeById?.(parseInt(String(nodeId), 10));
+    return !!n;
+}
+
+function _sqrCollectIds(getSqr) {
+    const ids = {};
+    SQR_NODE_ID_KEYS.forEach(k => { ids[k] = String(getSqr(k) || "").trim(); });
+    return ids;
+}
+
+function _sqrIdsNeedFix(ids) {
+    if (!_sqrIdsMinimalValid(ids)) return true;
+    if (ids.reference_images_node_id && !_sqrNodeExists(ids.reference_images_node_id)) return true;
+    return false;
+}
+
+function _sqrIdsMinimalValid(ids) {
+    return _sqrNodeExists(ids.reference_video_node_id)
+        && _sqrNodeExists(ids.output_node_id)
+        && _sqrNodeExists(ids.animate_embeds_node_id);
+}
+
+function _sqrLinkOriginNodeId(node, inputIndex) {
+    const graph = app.graph;
+    if (!graph || !node?.inputs || inputIndex < 0 || inputIndex >= node.inputs.length) return "";
+    const slot = node.inputs[inputIndex];
+    if (!slot?.link) return "";
+    const link = graph.links[slot.link];
+    if (!link) return "";
+    return String(link.origin_id);
+}
+
+function _sqrInputLinkOrigin(node, inputName) {
+    const graph = app.graph;
+    if (!graph || !node) return "";
+    const idx = (node.inputs || []).findIndex(i => i.name === inputName);
+    if (idx >= 0) {
+        const direct = _sqrLinkOriginNodeId(node, idx);
+        if (direct) return direct;
+    }
+    for (const link of Object.values(graph.links || {})) {
+        if (String(link.target_id) !== String(node.id)) continue;
+        const slot = node.inputs?.[link.target_slot];
+        if (slot?.name === inputName) return String(link.origin_id);
+    }
+    return "";
+}
+
+function _sqrNodeTypeName(node) {
+    return String(node?.type || node?.comfyClass || "");
+}
+
+function _sqrNormalizeLabel(s) {
+    return String(s ?? "")
+        .replace(/[\u200b\uFEFF]/g, "")
+        .trim()
+        .normalize("NFKC");
+}
+
+/** 收集节点上所有可能被用户当作「名称/标题」的文本 */
+function _sqrCollectNodeLabels(node) {
+    if (!node) return [];
+    const out = new Set();
+    const add = (v) => {
+        const s = _sqrNormalizeLabel(v);
+        if (s) out.add(s);
+    };
+    try { add(typeof node.getTitle === "function" ? node.getTitle() : null); } catch (e) {}
+    add(node.title);
+    add(node.properties?.["Node name for S&R"]);
+    add(node.properties?.previousName);
+    add(node.properties?.NodeName);
+    add(node.properties?.displayName);
+    if (node.properties && typeof node.properties === "object") {
+        for (const [k, v] of Object.entries(node.properties)) {
+            if (typeof v !== "string") continue;
+            if (/name|title|label|名称|标题/i.test(k)) add(v);
+        }
+    }
+    for (const w of node.widgets || []) {
+        if (!w || typeof w.value !== "string") continue;
+        if (/^(title|name|label|node_name|节点名称|名称|标题)$/i.test(String(w.name || ""))) {
+            add(w.value);
+        }
+    }
+    try {
+        if (typeof node.serialize === "function") {
+            const ser = node.serialize();
+            add(ser?.title);
+            add(ser?.properties?.["Node name for S&R"]);
+        }
+    } catch (e) {}
+    if (node.properties && typeof node.properties === "object") {
+        for (const v of Object.values(node.properties)) {
+            if (typeof v !== "string") continue;
+            const s = _sqrNormalizeLabel(v);
+            if (s.length < 2 || s.length > 32) continue;
+            if (/[\u4e00-\u9fff]/.test(s)) add(s);
+        }
+    }
+    return [...out];
+}
+
+function _sqrLabelMatchScore(labels, want) {
+    const w = _sqrNormalizeLabel(want);
+    if (!w || !labels?.length) return 0;
+    let best = 0;
+    for (const label of labels) {
+        if (label === w) best = Math.max(best, 1000);
+        else if (label.includes(w) && w.length >= 2) best = Math.max(best, 500 + w.length);
+        else if (w.includes(label) && label.length >= 4) best = Math.max(best, 200 + label.length);
+    }
+    return best;
+}
+
+/** 按节点标题识别；同名多节点时用类型提示消歧，标题仍优先于连线推断 */
+function _sqrFindNodeByTitle(aliasKey) {
+    const titles = SQR_NODE_TITLE_ALIASES[aliasKey] || [];
+    const graph = app.graph;
+    const typeHints = SQR_TITLE_TYPE_HINTS[aliasKey];
+    if (!titles.length || !graph?.nodes?.length) return "";
+
+    let bestNode = null;
+    let bestScore = 0;
+
+    for (const node of graph.nodes) {
+        const labels = _sqrCollectNodeLabels(node);
+        let nodeScore = 0;
+        for (const want of titles) {
+            nodeScore = Math.max(nodeScore, _sqrLabelMatchScore(labels, want));
+        }
+        if (nodeScore <= 0) continue;
+        if (typeHints && _sqrMatchesType(_sqrNodeTypeName(node), typeHints)) {
+            nodeScore += 50;
+        }
+        if (nodeScore > bestScore) {
+            bestScore = nodeScore;
+            bestNode = node;
+        }
+    }
+
+    if (bestNode && typeHints && !_sqrMatchesType(_sqrNodeTypeName(bestNode), typeHints)) {
+        console.warn(
+            `[SQR] 标题识别 ${aliasKey} → #${bestNode.id} (${_sqrNodeTypeName(bestNode)})，`
+            + "类型与预期不完全一致，仍按标题采用");
+    }
+    return bestNode ? String(bestNode.id) : "";
+}
+
+function _sqrDetectTitleIds() {
+    return {
+        reference_images_node_id: _sqrFindNodeByTitle("reference_images_node_id"),
+        output_node_id: _sqrFindNodeByTitle("output_node_id"),
+        reference_video_node_id: _sqrFindNodeByTitle("reference_video_node_id"),
+        animate_embeds_node_id: _sqrFindNodeByTitle("animate_embeds_node_id"),
+    };
+}
+
+function _sqrDebugDumpNodeLabels() {
+    const graph = app.graph;
+    if (!graph?.nodes) return;
+    const rows = graph.nodes.map(n => ({
+        id: n.id,
+        type: _sqrNodeTypeName(n),
+        labels: _sqrCollectNodeLabels(n).join(" | "),
+    }));
+    console.log("[SQR] 当前工作流节点名称一览（供标题识别调试）:");
+    console.table(rows);
+}
+
+function _sqrMatchesType(typeName, matchers) {
+    return matchers.some(fn => fn(typeName));
+}
+
+function _sqrResolveUpstreamByType(nodeId, matchers, visited = new Set()) {
+    const id = String(nodeId || "").trim();
+    if (!id || visited.has(id)) return "";
+    visited.add(id);
+    const node = app.graph?.getNodeById?.(parseInt(id, 10));
+    if (!node) return "";
+    const t = _sqrNodeTypeName(node);
+    if (_sqrMatchesType(t, matchers)) return id;
+    for (const inp of node.inputs || []) {
+        if (!inp?.link) continue;
+        const link = app.graph.links[inp.link];
+        if (!link) continue;
+        const found = _sqrResolveUpstreamByType(String(link.origin_id), matchers, visited);
+        if (found) return found;
+    }
+    return "";
+}
+
+function _sqrFindLinkOriginByInputName(node, inputName) {
+    const direct = _sqrInputLinkOrigin(node, inputName);
+    if (!direct) return "";
+    return _sqrResolveUpstreamByType(direct, SQR_LOAD_VIDEO_MATCHERS) || direct;
+}
+
+function _sqrFindRefVideoFromAE(aeNode) {
+    if (!aeNode) return "";
+    for (const name of SQR_AE_POSE_INPUTS) {
+        const origin = _sqrInputLinkOrigin(aeNode, name);
+        const loadId = _sqrResolveUpstreamByType(origin, SQR_LOAD_VIDEO_MATCHERS);
+        if (loadId) return loadId;
+    }
+    return "";
+}
+
+function _sqrFindRefImageFromAE(aeNode) {
+    if (!aeNode) return "";
+    const origin = _sqrInputLinkOrigin(aeNode, "ref_images");
+    return _sqrResolveUpstreamByType(origin, SQR_LOAD_IMAGE_MATCHERS) || "";
+}
+
+function _sqrVideoCombineScore(vc, aeNode) {
+    let score = 0;
+    const saveW = vc.widgets?.find(w => w.name === "save_output");
+    if (saveW?.value === true) score += 20;
+
+    if (aeNode && _sqrWalkUpstream(String(aeNode.id), vc.id)) score += 8;
+
+    const imgOrigin = _sqrInputLinkOrigin(vc, "images");
+    if (imgOrigin) {
+        const decodeId = _sqrResolveUpstreamByType(imgOrigin, SQR_DECODE_MATCHERS);
+        if (decodeId) score += 12;
+        if (aeNode && decodeId && _sqrWalkUpstream(String(aeNode.id), decodeId)) score += 6;
+    }
+    return score;
+}
+
+function _sqrFindOutputVideoCombine(aeNode) {
+    const byTitle = _sqrFindNodeByTitle("output_node_id");
+    if (byTitle) return byTitle;
+
+    const graph = app.graph;
+    if (!graph?.nodes) return "";
+    const vcNodes = graph.nodes.filter(n =>
+        n.type === "VHS_VideoCombine" || String(n.type || "").includes("VideoCombine"));
+    if (!vcNodes.length) return "";
+
+    let best = null;
+    let bestScore = -1;
+    for (const vc of vcNodes) {
+        const score = _sqrVideoCombineScore(vc, aeNode);
+        if (score > bestScore) {
+            bestScore = score;
+            best = vc;
+        }
+    }
+    if (best && bestScore > 0) return String(best.id);
+
+    const saveOut = vcNodes.find(vc => vc.widgets?.find(w => w.name === "save_output")?.value === true);
+    if (saveOut) return String(saveOut.id);
+    return vcNodes[0] ? String(vcNodes[0].id) : "";
+}
+
+function _sqrWalkUpstream(originId, targetId) {
+    const graph = app.graph;
+    if (!graph) return false;
+    const goal = String(originId);
+    const visited = new Set();
+    const queue = [String(targetId)];
+    while (queue.length) {
+        const cur = queue.pop();
+        if (visited.has(cur)) continue;
+        visited.add(cur);
+        const node = graph.getNodeById(parseInt(cur, 10));
+        if (!node) continue;
+        for (const inp of node.inputs || []) {
+            if (!inp?.link) continue;
+            const link = graph.links[inp.link];
+            if (!link) continue;
+            const oid = String(link.origin_id);
+            if (oid === goal) return true;
+            queue.push(oid);
+        }
+    }
+    return false;
+}
+
+function _sqrAutoDetectNodeIds(sqrNode) {
+    const graph = app.graph;
+    if (!graph?.nodes?.length) return null;
+
+    const titleIds = _sqrDetectTitleIds();
+    const riByTitle = titleIds.reference_images_node_id;
+    const vcByTitle = titleIds.output_node_id;
+    const refVidByTitle = titleIds.reference_video_node_id;
+    const aeByTitle = titleIds.animate_embeds_node_id;
+
+    const aeNodes = graph.nodes.filter(n =>
+        SQR_AE_TYPES.has(n.type) || SQR_AE_TYPES.has(n.comfyClass));
+    let aeNode = aeNodes[0] || null;
+    if (aeByTitle) {
+        aeNode = graph.getNodeById(parseInt(aeByTitle, 10)) || aeNode;
+    }
+
+    const refFromSqr = _sqrFindLinkOriginByInputName(sqrNode, "frame_rate")
+        || _sqrFindLinkOriginByInputName(sqrNode, "total_frames");
+    const refFromAe = _sqrFindRefVideoFromAE(aeNode);
+
+    if (aeNodes.length > 1 && !aeByTitle) {
+        const refHint = refVidByTitle || refFromAe || refFromSqr;
+        if (refHint) {
+            aeNode = aeNodes.find(ae => _sqrWalkUpstream(refHint, ae.id)) || aeNode;
+        }
+    }
+
+    const refVid = refVidByTitle || refFromAe || refFromSqr || _sqrFindRefVideoFromAE(aeNode);
+    const vcId = vcByTitle || _sqrFindOutputVideoCombine(aeNode);
+    const riId = riByTitle || _sqrFindRefImageFromAE(aeNode);
+
+    return {
+        reference_video_node_id: refVid || "",
+        animate_embeds_node_id: aeNode ? String(aeNode.id) : (aeByTitle || ""),
+        output_node_id: vcId || "",
+        reference_images_node_id: riId || "",
+    };
+}
+
+function _sqrApplyNodeIds(setSqr, ids) {
+    SQR_NODE_ID_KEYS.forEach(k => {
+        if (ids[k] != null) setSqr(k, String(ids[k]).trim());
+    });
+}
+
+function _sqrSyncNodeIds(sqrNode, getSqr, setSqr, { forceAuto = false } = {}) {
+    const titleIds = _sqrDetectTitleIds();
+    const titleHits = Object.entries(titleIds).filter(([, v]) => v);
+    const hasTitleHit = titleHits.length > 0;
+    const mergeTitle = (base) => ({ ...base, ...Object.fromEntries(titleHits) });
+
+    if (hasTitleHit) {
+        _sqrApplyNodeIds(setSqr, titleIds);
+    }
+
+    const current = _sqrCollectIds(getSqr);
+    const merged = mergeTitle(current);
+
+    if (titleIds.reference_images_node_id && titleIds.output_node_id) {
+        _sqrApplyNodeIds(setSqr, merged);
+        _sqrSavePersistedNodeIds(sqrNode, _sqrCollectIds(getSqr));
+        sqrNode.setDirtyCanvas?.(true, true);
+        return { ids: _sqrCollectIds(getSqr), source: "title" };
+    }
+
+    if (!forceAuto && hasTitleHit) {
+        if (_sqrIdsMinimalValid(merged) || (merged.output_node_id && merged.reference_images_node_id)) {
+            _sqrApplyNodeIds(setSqr, merged);
+            _sqrSavePersistedNodeIds(sqrNode, _sqrCollectIds(getSqr));
+            return { ids: _sqrCollectIds(getSqr), source: "title" };
+        }
+    }
+
+    if (!forceAuto && !_sqrIdsNeedFix(current)) {
+        if (hasTitleHit) {
+            _sqrApplyNodeIds(setSqr, merged);
+            _sqrSavePersistedNodeIds(sqrNode, _sqrCollectIds(getSqr));
+            return { ids: _sqrCollectIds(getSqr), source: "title+workflow" };
+        }
+        _sqrSavePersistedNodeIds(sqrNode, current);
+        return { ids: current, source: "workflow" };
+    }
+
+    if (!forceAuto) {
+        const saved = _sqrLoadPersistedNodeIds(sqrNode);
+        if (saved && !_sqrIdsNeedFix(saved)) {
+            const savedMerged = mergeTitle(saved);
+            _sqrApplyNodeIds(setSqr, savedMerged);
+            sqrNode.setDirtyCanvas?.(true, true);
+            return { ids: _sqrCollectIds(getSqr), source: hasTitleHit ? "localStorage+title" : "localStorage" };
+        }
+    }
+
+    const detected = _sqrAutoDetectNodeIds(sqrNode);
+    const finalIds = mergeTitle(detected || {});
+    if (!finalIds || !_sqrIdsMinimalValid(finalIds)) {
+        if (forceAuto) {
+            _sqrDebugDumpNodeLabels();
+            console.warn("[SQR] 标题识别 partial:", titleIds);
+        }
+        return { ids: _sqrCollectIds(getSqr), source: "missing", detected, titleIds };
+    }
+
+    _sqrApplyNodeIds(setSqr, finalIds);
+    _sqrSavePersistedNodeIds(sqrNode, finalIds);
+    sqrNode.setDirtyCanvas?.(true, true);
+    return { ids: finalIds, source: hasTitleHit ? "auto+title" : "auto" };
+}
+
+
 // ── 节点ID设置弹窗 ────────────────────────────────────────────────
-function showNodeIdSelector(fields, onConfirm) {
+function showNodeIdSelector(fields, onConfirm, onAutoDetect) {
     document.getElementById("sqr-nodeid-overlay")?.remove();
     const overlay=document.createElement("div");
     overlay.id="sqr-nodeid-overlay";
@@ -140,7 +635,10 @@ function showNodeIdSelector(fields, onConfirm) {
         boxShadow:"0 8px 40px rgba(0,0,0,.7)"});
     const mkDiv=(t,s)=>Object.assign(document.createElement("div"),{textContent:t,style:s||""});
     box.appendChild(mkDiv("🔧  设置节点 ID","font-size:14px;font-weight:600;"));
-    box.appendChild(mkDiv("节点 ID 可通过 ComfyUI → 设置 → 画面 → 节点 → 标签 → 显示全部 开启显示","font-size:11px;opacity:.5;line-height:1.5;"));
+    box.appendChild(mkDiv(
+        "节点 ID 可通过 ComfyUI → 设置 → 画面 → 节点 → 标签 → 显示全部 开启显示。"
+        + " 自动识别优先匹配节点标题：加载图像节点、输出视频节点 等。",
+        "font-size:11px;opacity:.5;line-height:1.5;"));
 
     const inputs={};
     fields.forEach(({key,label,tooltip,value})=>{
@@ -156,9 +654,18 @@ function showNodeIdSelector(fields, onConfirm) {
         inputs[key]=inp; row.append(lbl,inp); box.appendChild(row);
     });
 
-    const btns=document.createElement("div"); btns.style.cssText="display:flex;gap:8px;margin-top:4px;";
+    const btns=document.createElement("div"); btns.style.cssText="display:flex;gap:8px;margin-top:4px;flex-wrap:wrap;";
     const mkBtn=(t,s,fn)=>{const b=Object.assign(document.createElement("button"),{textContent:t});
-        b.style.cssText=`flex:1;padding:6px 18px;border-radius:6px;cursor:pointer;${s}`;b.onclick=fn;return b;};
+        b.style.cssText=`flex:1;min-width:88px;padding:6px 18px;border-radius:6px;cursor:pointer;${s}`;b.onclick=fn;return b;};
+    if (onAutoDetect) {
+        btns.appendChild(mkBtn("🔍 自动识别","background:#356;color:#fff;border:none;",()=>{
+            const detected = onAutoDetect();
+            if (!detected) { alert("未能自动识别节点 ID，请确认 frame_rate / 参考视频 / AnimateEmbeds / VHS 输出节点已连线。"); return; }
+            fields.forEach(({ key }) => {
+                if (detected[key] != null && inputs[key]) inputs[key].value = String(detected[key]);
+            });
+        }));
+    }
     btns.append(
         mkBtn("取消","",()=>overlay.remove()),
         mkBtn("✓ 确认","background:#2a9;color:#fff;border:none;font-weight:600;",()=>{
@@ -322,6 +829,15 @@ app.registerExtension({
         const origQueuePrompt = app.queuePrompt?.bind(app);
         if (!origQueuePrompt) return;
 
+        const origGraphToPrompt = app.graphToPrompt?.bind(app);
+        if (origGraphToPrompt) {
+            app.graphToPrompt = async function(...args) {
+                (app.graph?.nodes || []).filter(n => n.type === "SegmentQueueRunner")
+                    .forEach(_sqrSanitizeRunnerWidgets);
+                return origGraphToPrompt(...args);
+            };
+        }
+
         app.queuePrompt = async function(number, batchCount) {
             const sqrNodes = (app.graph?.nodes || []).filter(n =>
                 n.type === "SegmentQueueRunner" && !n.muted && n.mode !== 4
@@ -331,6 +847,7 @@ app.registerExtension({
             }
 
             for (const sqrNode of sqrNodes) {
+                _sqrSanitizeRunnerWidgets(sqrNode);
                 const getNodeW = name => sqrNode.widgets?.find(w => w.name === name);
                 const preW = getNodeW("sqr_pre_segments");
                 if (preW) preW.value = "";
@@ -371,6 +888,21 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== "SegmentQueueRunner") return;
 
+        const origConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function(info) {
+            const rc = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+            const n = this;
+            _sqrSanitizeRunnerWidgets(n);
+            setTimeout(() => {
+                _sqrSanitizeRunnerWidgets(n);
+                const gw = name => n.widgets?.find(w => w.name === name);
+                const getSqr = k => gw(k)?.value || "";
+                const setSqr = (k, v) => { const w = gw(k); if (w) w.value = v; };
+                _sqrSyncNodeIds(n, getSqr, setSqr);
+            }, 80);
+            return rc;
+        };
+
         const origCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function() {
             const r = origCreated ? origCreated.apply(this, arguments) : undefined;
@@ -391,6 +923,7 @@ app.registerExtension({
 
             const segW = getW("segment_count");
             const startW = getW("start_segment");
+            _sqrSanitizeRunnerWidgets(node);
 
             function _sqrApplySegMax() {
                 const maxVal = Math.max(2, Math.min(100, node._sqrSettings?.segMax || 100));
@@ -441,6 +974,10 @@ app.registerExtension({
 
             const getSqr = k => getW(k)?.value || "";
             const setSqr = (k, v) => { const w = getW(k); if (w) w.value = v; };
+
+            const _sqrRunIdSync = () => _sqrSyncNodeIds(node, getSqr, setSqr);
+            setTimeout(_sqrRunIdSync, 120);
+            setTimeout(_sqrRunIdSync, 900);
 
             const _SQR_PNG_KEY   = "sqr_save_png";
             const _SQR_SEGMAX_KEY = "sqr_seg_max";
@@ -617,13 +1154,57 @@ app.registerExtension({
                     {key:"reference_images_node_id",   label:"参考图 LoadImage ID",        tooltip:"LoadImage node ID",              value:getSqr("reference_images_node_id")},
                     {key:"reference_video_node_id", label:"参考视频 Load Video ID",      tooltip:"Load Video (target) node ID",    value:getSqr("reference_video_node_id")},
                     {key:"output_node_id",     label:"输出 VHS_VideoCombine ID",    tooltip:"Main output VHS_VideoCombine ID",value:getSqr("output_node_id")},
-                    {key:"animate_embeds_node_id", label:"WanVideoAnimateEmbeds ID",    tooltip:"WanVideoAnimateEmbeds node ID",  value:getSqr("animate_embeds_node_id")},
+                    {key:"animate_embeds_node_id", label:"AnimateEmbeds ID",    tooltip:"WanVideoAnimateEmbeds or WanAnimatePlus AnimateEmbeds node ID",  value:getSqr("animate_embeds_node_id")},
                 ], result=>{
                     Object.entries(result).forEach(([k,v]) => setSqr(k, v));
+                    _sqrSavePersistedNodeIds(node, result);
                     node.setDirtyCanvas?.(true, true);
+                }, () => {
+                    const sync = _sqrSyncNodeIds(node, getSqr, setSqr, { forceAuto: true });
+                    return sync.ids;
                 });
             });
             nodeIdBtn.serialize = false;
+
+            const autoIdBtn = node.addWidget("button", "🔍  自动识别节点 ID", null, () => {
+                const sync = _sqrSyncNodeIds(node, getSqr, setSqr, { forceAuto: true });
+                const src = { workflow: "工作流", localStorage: "本地记忆", auto: "自动识别", missing: "未识别" }[sync.source] || sync.source;
+                const ids = sync.ids || {};
+                const brief = [
+                    ids.reference_video_node_id && `视频=${ids.reference_video_node_id}`,
+                    ids.animate_embeds_node_id && `AE=${ids.animate_embeds_node_id}`,
+                    ids.output_node_id && `输出=${ids.output_node_id}`,
+                    ids.reference_images_node_id && `参考图=${ids.reference_images_node_id}`,
+                ].filter(Boolean).join("  ");
+                autoIdBtn.name = sync.source === "missing"
+                    ? "🔍  识别失败，请检查连线"
+                    : `🔍  已识别（${src}）`;
+                node.setDirtyCanvas?.(true, true);
+                setTimeout(() => {
+                    autoIdBtn.name = "🔍  自动识别节点 ID";
+                    node.setDirtyCanvas?.(true, true);
+                }, 2500);
+                const ti = sync.titleIds || {};
+                const titleBrief = [
+                    ti.reference_images_node_id && `参考图标题→#${ti.reference_images_node_id}`,
+                    ti.output_node_id && `输出标题→#${ti.output_node_id}`,
+                    ti.reference_video_node_id && `视频标题→#${ti.reference_video_node_id}`,
+                    ti.animate_embeds_node_id && `AE标题→#${ti.animate_embeds_node_id}`,
+                ].filter(Boolean).join("\n");
+                if (sync.source === "missing") {
+                    _sqrDebugDumpNodeLabels();
+                    alert(
+                        "未能自动识别全部节点 ID。\n\n"
+                        + (titleBrief ? `标题识别：\n${titleBrief}\n\n` : "标题识别：未找到「加载图像节点」「输出视频节点」\n"
+                            + "请双击节点标题栏改成这两个名字，或看 F12 表格 labels 列。\n\n")
+                        + "请确认：\n1. frame_rate / 总帧数 已连到参考 Load Video\n2. 工作流里有 AnimateEmbeds 与 VHS_VideoCombine"
+                    );
+                } else if (brief) {
+                    console.log(`[SQR] 节点 ID (${src}): ${brief}`);
+                    if (titleBrief) console.log(`[SQR] 标题识别:\n${titleBrief}`);
+                }
+            });
+            autoIdBtn.serialize = false;
 
             // ── 📋 查看日志按钮 ──
             const logBtn = node.addWidget("button", "📋  查看日志", null, () => {
@@ -747,7 +1328,7 @@ app.registerExtension({
                 const rtw = getW("enable_resume"); if (rtw) rtw.value = false;
                 const fromW2 = getW("start_segment");
                 if (fromW2) fromW2.value = 1;
-                const foW = getW("sqr_frame_offset"); if (foW) foW.value = -1;
+                const foW = getW("sqr_frame_offset"); if (foW) foW.value = "-1";
                 resumeBtn.name = "🎬  已清除，从第1段开始";
                 node.setDirtyCanvas?.(true, true);
                 setTimeout(() => {
@@ -762,7 +1343,7 @@ app.registerExtension({
                 const _hw = getW(_hk);
                 if (_hw) { _hw.computeSize = () => [0, -4]; _hw.draw = () => {}; }
             }
-            { const w = getW("sqr_frame_offset"); if (w) w.value = -1; }
+            { const w = getW("sqr_frame_offset"); if (w) w.value = "-1"; }
 
             // ── 已选图片管理弹窗 ──
             const showRefManager = (onConfirm) => {
@@ -894,18 +1475,72 @@ app.registerExtension({
                 }, 300);
             }
 
+            function _clearCheckpointBanner() {
+                (node._sqrBannerWidgets || []).forEach(w => {
+                    const i = node.widgets?.indexOf(w);
+                    if (i >= 0) node.widgets.splice(i, 1);
+                });
+                node._sqrBannerWidgets = null;
+                node._sqrCheckpointBanner = false;
+                node.setDirtyCanvas?.(true, true);
+            }
+
+            // 一键续跑：复用「自动续跑」已算好的全部参数（起始段/偏移/PNG目录/分段数/参考图）
+            function _applyAutoResume(ckpt) {
+                const lvBad = ckpt.ref_video_match === false;
+                const ckptParams = ckpt.ref_video_params || {};
+                const base = (typeof ckpt.base_frame_offset === "number" && ckpt.base_frame_offset > 0) ? ckpt.base_frame_offset : -1;
+                const foW = getW("sqr_frame_offset"); if (foW) foW.value = String(base);
+                const _resumeSrc = (ckpt.transition_dir_exists && ckpt.transition_dir_path) ? ckpt.transition_dir_path : ckpt.transition_video;
+                setSqr("resume_video_path", _resumeSrc);
+                const rtw = getW("enable_resume"); if (rtw) rtw.value = true;
+                const _resumeLabel = ckpt.transition_dir_exists ? ckpt.transition_dir : ckpt.transition_video;
+                resumeBtn._sqrActive = true; resumeBtn.name = "🎬  " + _resumeLabel;
+                const fromW = getW("start_segment"); const segWw = getW("segment_count");
+                _sqrEnsureSegCapacity(ckpt.segments);
+                if (segWw) segWw.value = ckpt.segments;
+                if (fromW) fromW.value = Math.min(ckpt.next_seg, ckpt.total_segs);
+                if (lvBad) { try { const vn = app.graph?.getNodeById?.(parseInt(getSqr("reference_video_node_id"))); if (vn) { const sv=(n,v)=>{const w=vn.widgets?.find(w=>w.name===n);if(w)w.value=v;}; sv("video",ckptParams.video);sv("force_rate",ckptParams.force_rate);sv("frame_load_cap",ckptParams.frame_load_cap);sv("skip_first_frames",ckptParams.skip_first_frames);sv("select_every_nth",ckptParams.select_every_nth);vn.setDirtyCanvas?.(true,true); } } catch(e) {} }
+                if (ckpt.ref_images?.length) { const si = Math.min(ckpt.next_seg-1, ckpt.ref_images.length-1); const sl = ckpt.ref_images.slice(si); if (sl.length) setSqr("segment_reference_images", sl.join(",")); }
+                if (segWw && startW) { startW.options.max = Math.round(segWw.value); if (startW.value > startW.options.max) startW.value = startW.options.max; }
+                const tw = node.widgets?.find(w=>w.name==="_sqr_ref_thumbs"); if (tw) tw.syncPaths?.();
+                node.setDirtyCanvas?.(true, true);
+            }
+
             function _showCheckpointBanner(ckpt) {
                 if (node._sqrCheckpointBanner) return; node._sqrCheckpointBanner = true;
-                const bannerBtn = node.addWidget("button", `⚠  上次第${ckpt.completed_seg}/${ckpt.total_segs}段中断 → 点击选择续跑方式`, null, () => _showResumeDialog(ckpt, bannerBtn));
-                bannerBtn.serialize = false;
-                bannerBtn.draw = function(ctx, node, widget_width, y, H) {
-                    ctx.fillStyle = this._hover ? "rgba(255,160,0,0.45)" : "rgba(255,160,0,0.28)";
-                    ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(4, y+2, widget_width-8, H-4, 4); else ctx.rect(4, y+2, widget_width-8, H-4); ctx.fill();
-                    ctx.strokeStyle = "rgba(255,160,0,0.8)"; ctx.lineWidth = 1; ctx.stroke();
-                    ctx.fillStyle = "#ffcc00"; ctx.font = "bold 11px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-                    ctx.fillText(this.name, widget_width / 2, y + H / 2); ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+                const _seg = Math.min(ckpt.next_seg, ckpt.total_segs);
+
+                // 主按钮：一键续跑（点一下应用全部参数，不自动运行）
+                const oneClickBtn = node.addWidget("button", `▶  一键续跑（第${_seg}/${ckpt.total_segs}段）`, null, () => {
+                    if (oneClickBtn._sqrReady) return;
+                    _applyAutoResume(ckpt);
+                    oneClickBtn._sqrReady = true;
+                    oneClickBtn.name = `✅  已就绪：第${_seg}/${ckpt.total_segs}段续跑 — 点右上角运行`;
+                    node.setDirtyCanvas?.(true, true);
+                });
+                oneClickBtn.serialize = false;
+                oneClickBtn.draw = function(ctx, node, ww, y, H) {
+                    const ready = !!this._sqrReady;
+                    ctx.fillStyle = ready ? "rgba(30,170,130,0.40)" : (this._hover ? "rgba(255,160,0,0.50)" : "rgba(255,160,0,0.30)");
+                    ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(4, y+2, ww-8, H-4, 4); else ctx.rect(4, y+2, ww-8, H-4); ctx.fill();
+                    ctx.strokeStyle = ready ? "rgba(60,200,130,0.9)" : "rgba(255,160,0,0.85)"; ctx.lineWidth = 1; ctx.stroke();
+                    ctx.fillStyle = ready ? "#7fffb0" : "#ffcc00"; ctx.font = "bold 11px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+                    ctx.fillText(this.name, ww / 2, y + H / 2); ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
                 };
-                const idx = node.widgets.indexOf(bannerBtn); if (idx > 0) { node.widgets.splice(idx, 1); node.widgets.unshift(bannerBtn); }
+
+                // 次按钮：高级续跑设置（打开原弹窗：参数变化警告 / 重新设计 / 手动选视频）
+                const advBtn = node.addWidget("button", `⚙  高级续跑设置（上次中断于第${ckpt.completed_seg}/${ckpt.total_segs}段）`, null, () => _showResumeDialog(ckpt));
+                advBtn.serialize = false;
+                advBtn.draw = function(ctx, node, ww, y, H) {
+                    ctx.fillStyle = this._hover ? "rgba(255,255,255,0.10)" : "rgba(255,255,255,0.04)";
+                    ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(10, y+3, ww-20, H-6, 4); else ctx.rect(10, y+3, ww-20, H-6); ctx.fill();
+                    ctx.fillStyle = "rgba(200,200,200,0.75)"; ctx.font = "10px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+                    ctx.fillText(this.name, ww / 2, y + H / 2); ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+                };
+
+                node._sqrBannerWidgets = [oneClickBtn, advBtn];
+                [advBtn, oneClickBtn].forEach(w => { const i = node.widgets.indexOf(w); if (i > 0) { node.widgets.splice(i, 1); node.widgets.unshift(w); } });
                 node.setDirtyCanvas?.(true, true);
             }
 
@@ -922,7 +1557,8 @@ app.registerExtension({
 
                 box.appendChild(mkDiv("⚠  检测到上次中断 — 选择续跑方式","font-size:15px;font-weight:700;color:#ffcc00;"));
                 const infoDiv = document.createElement("div");infoDiv.style.cssText="font-size:12px;background:rgba(255,255,255,0.05);padding:8px 10px;border-radius:6px;line-height:1.9;";
-                infoDiv.innerHTML = `上次完成：第 ${ckpt.completed_seg} / ${ckpt.total_segs} 段 &nbsp;·&nbsp; 平均分段数：<span style="color:#6df">${ckpt.segments}</span> &nbsp;·&nbsp; 续跑视频：<span style="color:#6df">${ckpt.transition_video}</span> &nbsp;·&nbsp; 时间：${ckpt.timestamp}`;
+                const _trSrcName = ckpt.transition_dir_exists ? `${ckpt.transition_dir}（无损PNG，零色偏）` : ckpt.transition_video;
+                infoDiv.innerHTML = `上次完成：第 ${ckpt.completed_seg} / ${ckpt.total_segs} 段 &nbsp;·&nbsp; 平均分段数：<span style="color:#6df">${ckpt.segments}</span> &nbsp;·&nbsp; 续跑衔接：<span style="color:#6df">${_trSrcName}</span> &nbsp;·&nbsp; 时间：${ckpt.timestamp}`;
                 box.appendChild(infoDiv);
 
                 const warns = [];
@@ -931,29 +1567,27 @@ app.registerExtension({
                 if (warns.length) { const w = document.createElement("div"); w.style.cssText="font-size:12px;color:#ffaa44;padding:6px 10px;border:1px solid rgba(255,160,0,0.35);border-radius:6px;display:flex;flex-direction:column;gap:3px;"; warns.forEach(t => w.appendChild(mkDiv(`⚠ ${t}`))); box.appendChild(w); }
 
                 const applyAndClose = (mode, opts={}) => {
-                    let fo;
-                    if (mode === "auto") { const base = typeof ckpt.base_frame_offset === "number" && ckpt.base_frame_offset > 0 ? ckpt.base_frame_offset : -1; fo = base; }
-                    else { const redesignFo = typeof ckpt.frame_offset_for_resume === "number" && ckpt.frame_offset_for_resume > 0 ? ckpt.frame_offset_for_resume : -1; fo = redesignFo; }
-                    const foW = getW("sqr_frame_offset"); if (foW) foW.value = fo;
-                    setSqr("resume_video_path", ckpt.transition_video);
-                    const rtw = getW("enable_resume"); if (rtw) rtw.value = true;
-                    resumeBtn._sqrActive = true; resumeBtn.name = "🎬  " + ckpt.transition_video;
-                    const fromW = getW("start_segment"); const segWw = getW("segment_count");
                     if (mode === "auto") {
-                        _sqrEnsureSegCapacity(ckpt.segments);
-                        if (segWw) segWw.value = ckpt.segments;
-                        if (fromW) fromW.value = Math.min(ckpt.next_seg, ckpt.total_segs);
-                        if (lvBad) { try { const vn = app.graph?.getNodeById?.(parseInt(getSqr("reference_video_node_id"))); if (vn) { const sv=(n,v)=>{const w=vn.widgets?.find(w=>w.name===n);if(w)w.value=v;}; sv("video",ckptParams.video);sv("force_rate",ckptParams.force_rate);sv("frame_load_cap",ckptParams.frame_load_cap);sv("skip_first_frames",ckptParams.skip_first_frames);sv("select_every_nth",ckptParams.select_every_nth);vn.setDirtyCanvas?.(true,true); } } catch(e) {} }
-                        if (ckpt.ref_images?.length) { const si = Math.min(ckpt.next_seg-1, ckpt.ref_images.length-1); const sl = ckpt.ref_images.slice(si); if (sl.length) setSqr("segment_reference_images", sl.join(",")); }
-                    } else {
-                        if (fromW) fromW.value = 1;
-                        if (opts.newSegCount) _sqrEnsureSegCapacity(opts.newSegCount);
-                        if (opts.newSegCount && segWw) segWw.value = opts.newSegCount;
-                        if (opts.newRefs?.length) setSqr("segment_reference_images", opts.newRefs.join(","));
+                        _applyAutoResume(ckpt);
+                        _clearCheckpointBanner();
+                        overlay.remove(); node.setDirtyCanvas?.(true,true);
+                        return;
                     }
+                    const redesignFo = (typeof ckpt.frame_offset_for_resume === "number" && ckpt.frame_offset_for_resume > 0) ? ckpt.frame_offset_for_resume : -1;
+                    const foW = getW("sqr_frame_offset"); if (foW) foW.value = String(redesignFo);
+                    const _resumeSrc = (ckpt.transition_dir_exists && ckpt.transition_dir_path) ? ckpt.transition_dir_path : ckpt.transition_video;
+                    setSqr("resume_video_path", _resumeSrc);
+                    const rtw = getW("enable_resume"); if (rtw) rtw.value = true;
+                    const _resumeLabel = ckpt.transition_dir_exists ? ckpt.transition_dir : ckpt.transition_video;
+                    resumeBtn._sqrActive = true; resumeBtn.name = "🎬  " + _resumeLabel;
+                    const fromW = getW("start_segment"); const segWw = getW("segment_count");
+                    if (fromW) fromW.value = 1;
+                    if (opts.newSegCount) _sqrEnsureSegCapacity(opts.newSegCount);
+                    if (opts.newSegCount && segWw) segWw.value = opts.newSegCount;
+                    if (opts.newRefs?.length) setSqr("segment_reference_images", opts.newRefs.join(","));
                     if (segWw && startW) { startW.options.max = Math.round(segWw.value); if (startW.value > startW.options.max) startW.value = startW.options.max; }
                     const tw = node.widgets?.find(w=>w.name==="_sqr_ref_thumbs"); if (tw) tw.syncPaths?.();
-                    if (bannerWidget) { node._sqrCheckpointBanner = false; const bi = node.widgets?.indexOf(bannerWidget); if (bi>=0) node.widgets.splice(bi,1); }
+                    _clearCheckpointBanner();
                     overlay.remove(); node.setDirtyCanvas?.(true,true);
                 };
 
@@ -968,7 +1602,7 @@ app.registerExtension({
                     return card;
                 };
 
-                box.appendChild(mkCard("⊗","关闭续跑","不衔接，全新生成一份","rgba(200,80,80,0.7)",()=>{_clearVideo();overlay.remove();}));
+                box.appendChild(mkCard("⊗","关闭续跑","不衔接，全新生成一份","rgba(200,80,80,0.7)",()=>{_clearVideo();_clearCheckpointBanner();overlay.remove();}));
                 const autoHints = []; if (segChanged) autoHints.push(`恢复分段数为 ${ckpt.segments} 段`); if (lvBad) autoHints.push("恢复 Load Video 参数");
                 const autoHint = autoHints.length ? `推荐 · 将自动${autoHints.join("、")}` : "推荐 · 一键套用，参考图可随时自行修改";
                 box.appendChild(mkCard("✅","自动续跑",autoHint,"rgba(30,170,130,0.8)",()=>applyAndClose("auto")));

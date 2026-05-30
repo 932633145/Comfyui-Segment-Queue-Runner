@@ -1,7 +1,7 @@
 {
   "SegmentQueueRunner": {
     "display_name": "分段队列 🎬",
-    "description": "将视频工作流按分段排队执行，支持预览和续跑。",
+    "description": "将视频工作流按分段排队执行，支持预览分段规划。",
     "inputs": {
       "frame_rate": {
         "name": "帧率",
@@ -17,15 +17,14 @@
       },
       "start_segment": {
         "name": "从第几段开始",
-        "tooltip": "从哪一段开始生成；续跑时请设置为实际起始段。"
+        "tooltip": "从哪一段开始生成。"
       },
       "execute": {
         "name": "执行",
         "tooltip": "关闭 = 仅预览分段规划；开启 = 正式执行。"
       },
       "enable_resume": {
-        "name": "启用续跑",
-        "tooltip": "开启后，使用上方所选视频作为首段过渡来源。"
+        "name": "启用续跑"
       },
       "reference_video_node_id": {
         "name": "参考视频节点ID"
@@ -43,7 +42,7 @@
         "name": "分段参考图"
       },
       "resume_video_path": {
-        "name": "续跑视频路径"
+        "name": "过渡视频路径"
       },
       "sqr_save_png": {
         "name": "保存 PNG"
@@ -52,7 +51,7 @@
         "name": "帧偏移"
       },
       "sqr_pre_segments": {
-        "name": "续跑前置分段"
+        "name": "前置分段"
       },
       "transition_skip_frames": {
         "name": "过渡跳过帧数"

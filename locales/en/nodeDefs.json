@@ -1,7 +1,7 @@
 {
   "SegmentQueueRunner": {
     "display_name": "Segment Queue Runner 🎬",
-    "description": "Split a video workflow into queued segments with preview and resume support.",
+    "description": "Split a video workflow into queued segments with segment plan preview.",
     "inputs": {
       "frame_rate": {
         "name": "Frame Rate",
@@ -17,15 +17,14 @@
       },
       "start_segment": {
         "name": "Start Segment",
-        "tooltip": "Segment number to start from. Set this to the actual start segment when resuming."
+        "tooltip": "Segment number to start from."
       },
       "execute": {
         "name": "Execute",
         "tooltip": "Off = preview the segment plan only. On = start execution."
       },
       "enable_resume": {
-        "name": "Enable Resume",
-        "tooltip": "When enabled, use the selected video above as the transition source for the first segment."
+        "name": "Enable Resume"
       },
       "reference_video_node_id": {
         "name": "Reference Video Node ID"
@@ -43,7 +42,7 @@
         "name": "Segment Reference Images"
       },
       "resume_video_path": {
-        "name": "Resume Video Path"
+        "name": "Transition Video Path"
       },
       "sqr_save_png": {
         "name": "Save PNG"
