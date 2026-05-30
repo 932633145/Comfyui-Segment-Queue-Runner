@@ -6,6 +6,10 @@ ComfyUI Segment Queue Runner（简称 SQR）是一个面向 **ComfyUI Wan Animat
 
 > 典型用途：显存不足但想生成长视频；需要从中断处继续跑；想按视频进度切换多张参考图；希望所有片段生成完成后自动合并成一个成片。
 
+> **项目说明**
+> - 本项目 **fork 自 [FeiHou 大佬的 Comfyui-Segment-Queue-Runner](https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner)**，并在其基础上进行 AI 修复与增强。
+> - 主要目标是让其 **兼容 Wuwu 大佬的独立版 [ComfyUI-WanAnimatePlus](https://github.com/wuwukaka/ComfyUI-WanAnimatePlus)**。
+
 ## 目录
 
 - [主要特性](#-主要特性)

@@ -4,6 +4,10 @@
 
 An automated long-video generation node for ComfyUI Wan Animate / KJ Context, supporting segmented generation, seamless transitions, auto scene switching, breakpoint resuming, auto merging, and audio sync.
 
+> **About this fork**
+> - Forked from [FeiHou's Comfyui-Segment-Queue-Runner](https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner), with AI-assisted fixes and enhancements.
+> - Primarily maintained for **compatibility with Wuwu's standalone [ComfyUI-WanAnimatePlus](https://github.com/wuwukaka/ComfyUI-WanAnimatePlus)**.
+
 ## ✨ Key Features
 - Segmented Generation: Automatically split long videos to avoid out-of-memory errors
 - Seamless Transitions: Use last frame of previous segment for smooth continuity
